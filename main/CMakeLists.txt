@@ -1,0 +1,30 @@
+idf_component_register(
+    SRCS 
+        "nvs_config.c" 
+        "api_client.c"
+        "ota_client.c"
+        "ws_client.c"
+        "monitor.c"
+        "task_control.c"
+        "main.cpp"
+    INCLUDE_DIRS "include"
+    REQUIRES 
+        HomeSpan 
+        PN532 
+        HK-HomeKit-Lib 
+        ESPAsyncWebServer 
+        libsodium 
+        mpr121
+        freertos
+        nvs_flash
+        esp_event
+        esp_netif
+        esp_http_client
+        app_update
+        esp_partition
+        json
+        mbedtls
+        esp-tls
+        esp_websocket_client
+)
+littlefs_create_partition_image(spiffs ../data FLASH_IN_PROJECT)
