@@ -15,6 +15,7 @@ extern "C" {
 #define NVS_KEY_SECRET  "device_secret"
 #define NVS_KEY_API     "api_base"
 #define NVS_KEY_LAST_FW "last_fw_id"
+#define NVS_KEY_PIN "pin"
 
 typedef struct {
     char wifi_ssid[33];
@@ -34,6 +35,10 @@ bool nvs_config_has_api_base(const device_config_t *cfg);
 
 esp_err_t nvs_config_set_last_fw_id(int fw_id);
 esp_err_t nvs_config_get_last_fw_id(int *out_fw_id);
+
+esp_err_t nvs_config_get_pin(char *out_pin, size_t out_sz);
+esp_err_t nvs_config_set_pin(const char *pin);
+
 
 #ifdef __cplusplus
 }

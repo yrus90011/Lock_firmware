@@ -128,3 +128,64 @@ esp_err_t nvs_config_get_last_fw_id(int *out_fw_id) {
     if (err == ESP_OK) *out_fw_id = (int)fw;
     return err;
 }
+
+static bool pin_is_valid_6_digit(const char *pin) {
+    if (!pin) return false;
+
+    size_t len = strlen(pin);
+    if (len != 6) return false;
+
+    for (size_t i = 0; i < len; i++) {
+        if (pin[i] < '0' || pin[i] > '9') {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+esp_err_t nvs_config_get_pin(char *out_pin, size_t out_sz) {
+    if (!out_pin || out_sz == 0) return ESP_ERR_INVALID_ARG;
+
+    out_pin[0] = '\0';
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS_DEVICE, NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_get_str_safe(h, NVS_KEY_PIN, out_pin, out_sz);
+    nvs_close(h);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (!pin_is_valid_6_digit(out_pin)) {
+        out_pin[0] = '\0';
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t nvs_config_set_pin(const char *pin) {
+    if (!pin_is_valid_6_digit(pin)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS_DEVICE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_str_safe(h, NVS_KEY_PIN, pin);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+
+    nvs_close(h);
+    return err;
+}

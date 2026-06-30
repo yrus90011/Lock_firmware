@@ -6,6 +6,8 @@ idf_component_register(
         "ws_client.c"
         "monitor.c"
         "task_control.c"
+        "evtlog.c"
+        "ws_log_upload.c"
         "main.cpp"
     INCLUDE_DIRS "include"
     REQUIRES 
@@ -26,5 +28,6 @@ idf_component_register(
         mbedtls
         esp-tls
         esp_websocket_client
+        spiffs
 )
 littlefs_create_partition_image(spiffs ../data FLASH_IN_PROJECT)

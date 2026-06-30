@@ -11,16 +11,81 @@
 #include "freertos/semphr.h"
 
 #include "cJSON.h"
+#include "ws_log_upload.h"
+#include "evtlog.h"
+
+#include "esp_system.h"
 
 static const char *TAG = "WS";
 
 static esp_websocket_client_handle_t s_ws = NULL;
-static TaskHandle_t s_keepalive_task = NULL;
 static SemaphoreHandle_t s_ws_tx_mu = NULL;
 static ws_event_cb_t s_cb = NULL;
 
+
+static char *s_headers = NULL;
+static ws_relogin_cb_t s_relogin_cb = NULL;
+static bool s_relogin_inflight = false;
+
+static TaskHandle_t s_authfail_task = NULL;
+static bool s_authfail_pending = false;
+
+static void ws_request_relogin_if_needed(int hs_status);
+
+static void ws_authfail_worker(void *arg)
+{
+    (void)arg;
+
+    // Small delay to get out of websocket task context cleanly
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Stop/destroy from THIS task (safe)
+    ws_client_stop();
+
+    // Clear pending BEFORE calling callback so we can retrigger if needed
+    s_authfail_pending = false;
+
+    // Ask app to login again (should be single-flight on your side)
+    if (s_relogin_cb) s_relogin_cb();
+
+    s_authfail_task = NULL;
+    vTaskDelete(NULL);
+}
+
+void ws_client_set_relogin_cb(ws_relogin_cb_t cb)
+{
+    s_relogin_cb = cb;
+}
+
+static void ws_request_relogin_if_needed(int hs_status)
+{
+    if (hs_status != 401 && hs_status != 403) return;
+
+    if (s_authfail_pending) return;
+    s_authfail_pending = true;
+
+    ESP_LOGW(TAG, "WS handshake %d -> relogin required", hs_status);
+
+    if (s_authfail_task == NULL) {
+        xTaskCreatePinnedToCore(
+            ws_authfail_worker,
+            "ws_authfail",
+            4096,
+            NULL,
+            5,
+            &s_authfail_task,
+            0
+        );
+    }
+}
+
 // store device_uuid if you later want to send a hello; not required for now
 static char s_api_base[192] = {0};
+
+bool ws_client_is_connected(void)
+{
+    return s_ws && esp_websocket_client_is_connected(s_ws);
+}
 
 static void build_ws_url_from_api_base(const char *api_base, char *out, size_t out_sz)
 {
@@ -51,7 +116,7 @@ static void log_hex_first64(const uint8_t *data, int len)
     ESP_LOGI(TAG, "BIN(%d) HEX(first %d): %s%s", len, max, line, (len > max) ? "..." : "");
 }
 
-static esp_err_t ws_send_text_locked(const char *text)
+esp_err_t ws_send_text_locked(const char *text)
 {
     if (!text) return ESP_ERR_INVALID_ARG;
     if (!s_ws || !esp_websocket_client_is_connected(s_ws)) return ESP_ERR_INVALID_STATE;
@@ -79,27 +144,6 @@ esp_err_t ws_client_send_text(const char *text)
     return err;
 }
 
-static void ws_keepalive_task_fn(void *arg)
-{
-    (void)arg;
-    while (1) {
-        if (s_ws && esp_websocket_client_is_connected(s_ws)) {
-            (void)ws_send_text_locked("{\"type\":\"status_check\"}");
-        }
-        vTaskDelay(pdMS_TO_TICKS(30000));
-    }
-}
-
-void ws_client_suspend_aux_tasks(void)
-{
-    if (s_keepalive_task) vTaskSuspend(s_keepalive_task);
-}
-
-void ws_client_resume_aux_tasks(void)
-{
-    if (s_keepalive_task) vTaskResume(s_keepalive_task);
-}
-
 static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     (void)handler_args;
@@ -110,17 +154,33 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t 
     switch (event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
             ESP_LOGI(TAG, "CONNECTED");
+            s_relogin_inflight = false;
+            s_authfail_pending = false;
             // send initial status_check
             (void)ws_send_text_locked("{\"type\":\"status_check\"}");
             break;
 
         case WEBSOCKET_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "DISCONNECTED");
+            evtlog_push(EVT_WS_DISCONNECT);
+            stop_backend();
             break;
 
-        case WEBSOCKET_EVENT_ERROR:
+        case WEBSOCKET_EVENT_ERROR: {
             ESP_LOGE(TAG, "ERROR");
+
+            int hs = 0;
+
+            if (d) {
+                hs = d->error_handle.esp_ws_handshake_status_code;
+            }
+
+            if (hs == 401 || hs == 403) {
+                ws_request_relogin_if_needed(hs);
+            }
+
             break;
+        }
 
         case WEBSOCKET_EVENT_DATA: {
             if (d->op_code == 0x1 /* text */) {
@@ -137,14 +197,48 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t 
                 cJSON *root = cJSON_Parse(msg);
                 if (root) {
                     cJSON *jt = cJSON_GetObjectItem(root, "type");
-                    if (cJSON_IsString(jt) && jt->valuestring && strcmp(jt->valuestring, "event") == 0) {
-                        cJSON *pl = cJSON_GetObjectItem(root, "payload");
-                        cJSON *cmd = pl ? cJSON_GetObjectItem(pl, "command") : NULL;
-                        if (cJSON_IsString(cmd) && cmd->valuestring && s_cb) {
-                            // callback is expected to be fast; it should spawn tasks if doing work
-                            s_cb(jt->valuestring, cmd->valuestring);
+
+                    if (cJSON_IsString(jt) && jt->valuestring) {
+
+                        // 1) Handle your existing event->command callback (OTA etc.)
+                        if (strcmp(jt->valuestring, "event") == 0 ) {
+                            cJSON *pl = cJSON_GetObjectItem(root, "payload");
+                            cJSON *cmd = pl ? cJSON_GetObjectItem(pl, "command") : NULL;
+                            if (cJSON_IsString(cmd) && cmd->valuestring && s_cb) {
+                                s_cb(jt->valuestring, cmd->valuestring);
+                            }
+                        }
+
+                        if (strcmp(jt->valuestring, "signal") == 0 ) {
+                            cJSON *pl = cJSON_GetObjectItem(root, "payload");
+                            cJSON *cmd = pl ? cJSON_GetObjectItem(pl, "type") : NULL;
+                            if (cJSON_IsString(cmd) && cmd->valuestring && s_cb) {
+                                s_cb(jt->valuestring, cmd->valuestring);
+                            }
+                        }
+
+                        if (strcmp(jt->valuestring, "live") == 0) {
+                            ESP_LOGI(TAG, "WS LIVE received");
+                            if (s_cb) {
+                                s_cb("live", "");
+                            }
+                        }
+
+                        // 2) Handle log upload protocol (ready/progress/done/error)
+                        else if (!strncmp(jt->valuestring, "log_upload_", 11)) {
+                            ws_log_upload_on_rx_json(msg);
+                        }
+
+                        // (optional) handle command type if your server also sends {"type":"command",...}
+                        else if (strcmp(jt->valuestring, "command") == 0) {
+                            cJSON *pl = cJSON_GetObjectItem(root, "payload");
+                            cJSON *cmd = pl ? cJSON_GetObjectItem(pl, "command") : NULL;
+                            if (cJSON_IsString(cmd) && cmd->valuestring && s_cb) {
+                                s_cb(jt->valuestring, cmd->valuestring);
+                            }
                         }
                     }
+
                     cJSON_Delete(root);
                 }
 
@@ -153,11 +247,11 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t 
                 ESP_LOGI(TAG, "RX: binary frame");
                 log_hex_first64((const uint8_t *)d->data_ptr, d->data_len);
             } else {
-                ESP_LOGI(TAG, "RX: op=%d len=%d", (int)d->op_code, (int)d->data_len);
+                //ESP_LOGI(TAG, "RX: op=%d len=%d", (int)d->op_code, (int)d->data_len);
+                break;
             }
             break;
         }
-
         default:
             break;
     }
@@ -178,27 +272,30 @@ esp_err_t ws_client_start(const char *api_base, const char *bearer_token, ws_eve
     build_ws_url_from_api_base(api_base, ws_url, sizeof(ws_url));
 
     // headers must persist while the client exists
-    char *headers = (char *)calloc(1, 900);
-    if (!headers) return ESP_ERR_NO_MEM;
+    s_headers = (char *)calloc(1, 900);
+    if (!s_headers) return ESP_ERR_NO_MEM;
 
-    snprintf(headers, 900,
-             "Authorization: Bearer %s\r\n"
-             "Origin: %s\r\n"
-             "\r\n",
-             bearer_token, api_base);
+    snprintf(s_headers, 900,
+            "Authorization: Bearer %s\r\n"
+            "Origin: %s\r\n",
+            bearer_token, api_base);
 
     esp_websocket_client_config_t cfg = {
         .uri = ws_url,
-        .headers = headers, // keep alive (do not free)
+        .headers = s_headers, // keep alive
         .crt_bundle_attach = esp_crt_bundle_attach,
         .network_timeout_ms = 30000,
         .reconnect_timeout_ms = 5000,
-        .buffer_size = 2048,
+        .buffer_size = 4096,
+        .ping_interval_sec = 30,
+        .enable_close_reconnect = true,
+        .disable_auto_reconnect = true,
     };
 
     s_ws = esp_websocket_client_init(&cfg);
     if (!s_ws) {
-        free(headers);
+        free(s_headers);
+        s_headers = NULL;
         return ESP_FAIL;
     }
 
@@ -210,13 +307,12 @@ esp_err_t ws_client_start(const char *api_base, const char *bearer_token, ws_eve
         ESP_LOGE(TAG, "start failed: %s", esp_err_to_name(err));
         esp_websocket_client_destroy(s_ws);
         s_ws = NULL;
-        free(headers);
+
+        free(s_headers);
+        s_headers = NULL;
+
         return err;
     }
-
-    // keepalive task (can be suspended during OTA)
-    xTaskCreate(ws_keepalive_task_fn, "ws_keepalive", 4096, NULL, 4, &s_keepalive_task);
-
     return ESP_OK;
 }
 
@@ -224,17 +320,14 @@ void ws_client_stop(void)
 {
     if (!s_ws) return;
 
-    if (s_keepalive_task) {
-        vTaskDelete(s_keepalive_task);
-        s_keepalive_task = NULL;
-    }
-
     esp_websocket_client_stop(s_ws);
     esp_websocket_client_destroy(s_ws);
     s_ws = NULL;
 
-    // Note: headers memory was allocated in ws_client_start and is intentionally not freed here
-    // unless you store it in a static pointer. If you want zero leak, store headers in static and free here.
+    if (s_headers) {
+        free(s_headers);
+        s_headers = NULL;
+    }
 
     if (s_ws_tx_mu) {
         vSemaphoreDelete(s_ws_tx_mu);
@@ -242,4 +335,6 @@ void ws_client_stop(void)
     }
 
     ESP_LOGI(TAG, "WS stopped");
+    vTaskDelay(pdMS_TO_TICKS(250));
+    start_backend();
 }

@@ -27,6 +27,13 @@ esp_err_t api_get_latest_firmware(const char *api_base,
                                   const char *bearer_token,
                                   firmware_info_t *out_fw);
 
+esp_err_t api_get_firmware_list_json(const char *api_base,
+                                    const char *device_uuid,
+                                    const char *bearer_token,
+                                    char **out_json,
+                                    int *out_len);
+                                  
+
 esp_err_t api_get_firmware_by_id(const char *api_base,
                                  const char *device_uuid,
                                  const char *bearer_token,

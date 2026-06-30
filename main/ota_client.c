@@ -16,6 +16,8 @@
 #include "mbedtls/sha256.h"
 
 #include <stdbool.h>
+#include "task_control.h"
+#include "ws_client.h"
 
 static volatile bool s_ota_running = false;
 // You can call these from main.c; declare them extern if needed
@@ -58,6 +60,7 @@ static esp_err_t ota_stream_download_and_flash(const char *api_base,
                                                const char *expected_sha256_hex,
                                                int expected_file_size)
 {
+    app_tasks_suspend_all();
     char url[320];
     snprintf(url, sizeof(url), "%s/api/v1/firmware/%d/download", api_base, fw_id);
 
@@ -167,8 +170,21 @@ static esp_err_t ota_stream_download_and_flash(const char *api_base,
         if (expected_file_size > 0) {
             int pct = (int)(((int64_t)total * 100) / expected_file_size);
             if (pct > 100) pct = 100;
-            if (pct >= last_pct + 5) {
-                ESP_LOGI(TAG, "downloaded %d%% (%d/%d)", pct, total, expected_file_size);
+            if (pct >= last_pct + 5) { 
+                ESP_LOGI(TAG, "downloaded %d%% (%d/%d)", pct, total, expected_file_size);               
+                char ws_msg[256];
+                snprintf(ws_msg, sizeof(ws_msg),
+                        "{\"type\":\"event\",\"payload\":{"
+                        "\"response\":\"ota_progress\","
+                        "\"pct\":%d,"
+                        "\"received\":%d,"
+                        "\"total\":%d,"
+                        "\"text\":\"downloaded %d%% (%d/%d)\""
+                        "}}",
+                        pct, total, expected_file_size,
+                        pct, total, expected_file_size);
+
+                (void)ws_send_text_locked(ws_msg);
                 last_pct = pct;
             }
         } else if ((total & ((64 * 1024) - 1)) == 0) {
@@ -222,7 +238,10 @@ static esp_err_t ota_stream_download_and_flash(const char *api_base,
     }
 
     ESP_LOGW(TAG, "OTA success. Rebooting...");
+    (void)ws_client_send_text("{\"type\":\"event\",\"payload\":{\"response\":\"Rebooting...\"}}");
+
     vTaskDelay(pdMS_TO_TICKS(800));
+    app_tasks_resume_all();
     esp_restart();
     return ESP_OK;
 }
@@ -310,12 +329,9 @@ static void ota_by_id_task(void *arg)
     if (err == ESP_ERR_NOT_FOUND) {
         char msg[256];
         snprintf(msg, sizeof(msg),
-                 "{\"type\":\"event\",\"payload\":{\"command\":\"ota_result\",\"status\":\"error\",\"fw\":%d,\"message\":\"fw id does not exist\"}}",
+                 "{\"type\":\"event\",\"payload\":{\"response\":\"ota_result\",\"status\":\"error\",\"fw\":%d,\"message\":\"fw id does not exist\"}}",
                  a->fw_id);
         (void)ws_client_send_text(msg);
-
-        ws_client_resume_aux_tasks();
-        app_tasks_resume_all();
         s_ota_running = false;
         free(a);
         vTaskDelete(NULL);
@@ -324,12 +340,9 @@ static void ota_by_id_task(void *arg)
     if (err != ESP_OK) {
         char msg[256];
         snprintf(msg, sizeof(msg),
-                 "{\"type\":\"event\",\"payload\":{\"command\":\"ota_result\",\"status\":\"error\",\"fw\":%d,\"message\":\"fw lookup failed\"}}",
+                 "{\"type\":\"event\",\"payload\":{\"response\":\"ota_result\",\"status\":\"error\",\"fw\":%d,\"message\":\"fw lookup failed\"}}",
                  a->fw_id);
         (void)ws_client_send_text(msg);
-
-        ws_client_resume_aux_tasks();
-        app_tasks_resume_all();
         s_ota_running = false;
         free(a);
         vTaskDelete(NULL);
@@ -338,7 +351,7 @@ static void ota_by_id_task(void *arg)
     // Found fw -> start downloading + flashing (this reboots on success)
     char start_msg[256];
     snprintf(start_msg, sizeof(start_msg),
-             "{\"type\":\"event\",\"payload\":{\"command\":\"ota_result\",\"status\":\"running\",\"fw\":%d,\"message\":\"downloading\"}}",
+             "{\"type\":\"event\",\"payload\":{\"response\":\"ota_result\",\"status\":\"running\",\"fw\":%d,\"message\":\"downloading\"}}",
              a->fw_id);
     (void)ws_client_send_text(start_msg);
 
@@ -348,12 +361,9 @@ static void ota_by_id_task(void *arg)
     // If OTA succeeds, device reboots, so code below usually runs only on failure
     char end_msg[256];
     snprintf(end_msg, sizeof(end_msg),
-             "{\"type\":\"event\",\"payload\":{\"command\":\"ota_result\",\"status\":\"error\",\"fw\":%d,\"message\":\"ota failed\"}}",
+             "{\"type\":\"event\",\"payload\":{\"response\":\"ota_result\",\"status\":\"error\",\"fw\":%d,\"message\":\"ota failed\"}}",
              a->fw_id);
     (void)ws_client_send_text(end_msg);
-
-    ws_client_resume_aux_tasks();
-    app_tasks_resume_all();
     s_ota_running = false;
 
     free(a);
