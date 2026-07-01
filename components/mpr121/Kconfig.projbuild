@@ -40,7 +40,7 @@ menu "MPR121 Configuration"
 	config SCL_GPIO
 		int "SCL GPIO number"
 		range 0 GPIO_RANGE_MAX
-		default 19 if IDF_TARGET_ESP32
+		default 22 if IDF_TARGET_ESP32
 		default 12 if IDF_TARGET_ESP32S2 || IDF_TARGET_ESP32S3
 		default  6 # C3 and others
 		help
@@ -50,7 +50,7 @@ menu "MPR121 Configuration"
 	config SDA_GPIO
 		int "SDA GPIO number"
 		range 0 GPIO_RANGE_MAX
-		default 18 if IDF_TARGET_ESP32
+		default 21 if IDF_TARGET_ESP32
 		default 11 if IDF_TARGET_ESP32S2 || IDF_TARGET_ESP32S3
 		default  5 # C3 and others
 		help

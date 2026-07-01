@@ -72,6 +72,10 @@ enum class gpioMomentaryStateStatus : uint8_t
 #define HOMEKEY_ALWAYS_LOCK 0  // Flag indicating if a successful Homekey authentication should always set and publish the lock state
 #define HS_STATUS_LED 255 // HomeSpan Status LED GPIO pin
 #define HS_PIN 255 // GPIO Pin for a Configuration Mode button (more info on https://github.com/HomeSpan/HomeSpan/blob/master/docs/UserGuide.md#device-configuration-mode)
+#define NFC_PN532_SS 5
+#define NFC_PN532_SCK 18
+#define NFC_PN532_MISO 19
+#define NFC_PN532_MOSI 23
 
 // Actions
 #define NFC_NEOPIXEL_PIN 255 // GPIO Pin used for NeoPixel

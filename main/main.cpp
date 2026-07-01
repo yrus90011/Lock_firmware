@@ -195,6 +195,36 @@ PN532_SPI *pn532spi;
 PN532 *nfc;
 
 static const char *SHARED_UUID = "8cfaa2ec-2ed2-493b-8825-53d90a35e913";
+static constexpr std::array<uint8_t, 4> kDefaultNfcGpioPins{
+  NFC_PN532_SS, NFC_PN532_SCK, NFC_PN532_MISO, NFC_PN532_MOSI
+};
+
+static bool nfc_pin_sets_equal(const std::array<uint8_t, 4> &a, const std::array<uint8_t, 4> &b)
+{
+  return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+}
+
+static void create_nfc_driver(const std::array<uint8_t, 4> &pins)
+{
+  ESP_LOGI("NFC_SETUP", "PN532 SPI pins: SS=%u SCK=%u MISO=%u MOSI=%u",
+           pins[0], pins[1], pins[2], pins[3]);
+  pn532spi = new PN532_SPI(pins[0], pins[1], pins[2], pins[3]);
+  nfc = new PN532(*pn532spi);
+  nfc->begin();
+}
+
+static void destroy_nfc_driver()
+{
+  if (nfc) {
+    nfc->stop();
+    delete nfc;
+    nfc = nullptr;
+  }
+  if (pn532spi) {
+    delete pn532spi;
+    pn532spi = nullptr;
+  }
+}
 
 //uint8_t receiverMAC[] = {0x9C, 0x9E, 0x6E, 0xC3, 0x33, 0x00}; //JT-002 office
 //uint8_t receiverMAC[] = {0x9C, 0x9E, 0x6E, 0xC2, 0xFB, 0x10};  //JT-001  test
@@ -424,7 +454,7 @@ namespace espConfig
     bool webAuthEnabled = WEB_AUTH_ENABLED;
     std::string webUsername = WEB_AUTH_USERNAME;
     std::string webPassword = WEB_AUTH_PASSWORD;
-    std::array<uint8_t, 4> nfcGpioPins{SS, SCK, MISO, MOSI};
+    std::array<uint8_t, 4> nfcGpioPins{NFC_PN532_SS, NFC_PN532_SCK, NFC_PN532_MISO, NFC_PN532_MOSI};
     uint8_t btrLowStatusThreshold = 10;
     bool proxBatEnabled = false;
     bool hkDumbSwitchMode = false;
@@ -3364,9 +3394,14 @@ void setup() {
       }
     }
   }
-  pn532spi = new PN532_SPI(espConfig::miscConfig.nfcGpioPins[0], espConfig::miscConfig.nfcGpioPins[1], espConfig::miscConfig.nfcGpioPins[2], espConfig::miscConfig.nfcGpioPins[3]);
-  nfc = new PN532(*pn532spi);
-  nfc->begin();
+  create_nfc_driver(espConfig::miscConfig.nfcGpioPins);
+  if (!nfc->getFirmwareVersion() &&
+      !nfc_pin_sets_equal(espConfig::miscConfig.nfcGpioPins, kDefaultNfcGpioPins)) {
+    ESP_LOGW("NFC_SETUP", "PN532 did not answer using saved pins; retrying default pins");
+    destroy_nfc_driver();
+    espConfig::miscConfig.nfcGpioPins = kDefaultNfcGpioPins;
+    create_nfc_driver(espConfig::miscConfig.nfcGpioPins);
+  }
   io_init();
 
   if (espConfig::miscConfig.gpioActionPin && espConfig::miscConfig.gpioActionPin != 255) {
