@@ -68,6 +68,7 @@ extern "C" {
 #include "monitor.h"
 #include "ws_log_upload.h"
 #include "evtlog.h"
+#include "access_log_service.h"
 }
 
 #define BACKEND_START_BIT   (1 << 0)
@@ -88,6 +89,7 @@ bool deleteUID(const std::string& uid);
 bool cmd_get_kv(const char *cmd, const char *key, char *out, size_t out_len);
 bool deactivateUID(const std::string& uid);
 bool activateUID(const std::string& uid);
+bool isUIDStored(const std::string& uid);
 bool isUIDDeactivated(const std::string& uid);
 
 static bool s_live_serial_enabled = false;
@@ -187,6 +189,7 @@ typedef struct {
   char api_base[192];
   char device_uuid[64];
   char token[768];
+  char device_secret[128];
 } device_ctx_t;
 
 static device_ctx_t g_ctx{};
@@ -194,10 +197,16 @@ static device_ctx_t g_ctx{};
 PN532_SPI *pn532spi;
 PN532 *nfc;
 
-static const char *SHARED_UUID = "8cfaa2ec-2ed2-493b-8825-53d90a35e913";
 static constexpr std::array<uint8_t, 4> kDefaultNfcGpioPins{
   NFC_PN532_SS, NFC_PN532_SCK, NFC_PN532_MISO, NFC_PN532_MOSI
 };
+static constexpr uint8_t kPn532PassiveActivationRetries = 0xFF;
+static constexpr uint16_t kPn532PassivePollTimeoutMs = 1000;
+static constexpr uint32_t kPn532SameCardDebounceMs = 1200;
+static constexpr uint16_t kPn532RfCfgRegister = 0x633D;
+static constexpr uint8_t kPn532RfCfgMaxReceiverGain = 0x70;
+static std::string s_lastNfcUid;
+static TickType_t s_lastNfcUidTick = 0;
 
 static bool nfc_pin_sets_equal(const std::array<uint8_t, 4> &a, const std::array<uint8_t, 4> &b)
 {
@@ -226,10 +235,32 @@ static void destroy_nfc_driver()
   }
 }
 
-//uint8_t receiverMAC[] = {0x9C, 0x9E, 0x6E, 0xC3, 0x33, 0x00}; //JT-002 office
-//uint8_t receiverMAC[] = {0x9C, 0x9E, 0x6E, 0xC2, 0xFB, 0x10};  //JT-001  test
+static bool configure_nfc_for_detection()
+{
+  bool ok = true;
+  ok = nfc->SAMConfig() && ok;
+  ok = nfc->setRFField(0x02, 0x01) && ok;
+  ok = nfc->writeRegister(kPn532RfCfgRegister, kPn532RfCfgMaxReceiverGain, true) && ok;
+  ok = nfc->setPassiveActivationRetries(kPn532PassiveActivationRetries) && ok;
+  ESP_LOGI("NFC_SETUP", "PN532 tuned: RF cfg=0x%02X passive retries=0x%02X poll timeout=%u ms",
+           kPn532RfCfgMaxReceiverGain, kPn532PassiveActivationRetries, kPn532PassivePollTimeoutMs);
+  return ok;
+}
 
-uint8_t receiverMAC[] = {0xF0, 0xF5, 0xBD, 0xFB, 0xA9, 0x70}; //JT-003 : C0:5D:89:DE:14:F4
+static bool nfc_uid_recently_handled(const std::string &uid)
+{
+  return uid == s_lastNfcUid &&
+         (xTaskGetTickCount() - s_lastNfcUidTick) < pdMS_TO_TICKS(kPn532SameCardDebounceMs);
+}
+
+static void mark_nfc_uid_handled(const std::string &uid)
+{
+  s_lastNfcUid = uid;
+  s_lastNfcUidTick = xTaskGetTickCount();
+}
+
+static uint8_t receiverMAC[6] = {0};
+static bool s_receiver_mac_loaded = false;
 
 static volatile bool g_espnow_busy = false;
 static SemaphoreHandle_t g_espnow_send_done = nullptr;
@@ -629,6 +660,10 @@ static void seed_nvs_if_empty(bool force_reset) {
   device_config_t cfg{};
   esp_err_t e = nvs_config_load(&cfg);
 
+  const uint8_t DEF_RECEIVER_MAC[6] = {0x9C, 0x9E, 0x6E, 0xC2, 0xFB, 0x10}; //JT-001  test
+  //const uint8_t DEF_RECEIVER_MAC[6] = {0x9C, 0x9E, 0x6E, 0xC3, 0x33, 0x00}; //JT-002 office
+  //const uint8_t DEF_RECEIVER_MAC[6] = {0xF0, 0xF5, 0xBD, 0xFB, 0xA9, 0x70}; //JT-003
+
   bool need_seed = force_reset ||
                    (e != ESP_OK) ||
                    !nvs_config_has_wifi(&cfg) ||
@@ -636,6 +671,16 @@ static void seed_nvs_if_empty(bool force_reset) {
                    !nvs_config_has_api_base(&cfg);
 
   if (!need_seed) {
+    if (!cfg.receiver_mac_set) {
+      memcpy(cfg.receiver_mac, DEF_RECEIVER_MAC, sizeof(cfg.receiver_mac));
+      cfg.receiver_mac_set = true;
+      e = nvs_config_save(&cfg);
+      if (e == ESP_OK) {
+        ESP_LOGW(TAG_MAIN, "Seeded missing receiver MAC in NVS");
+      } else {
+        ESP_LOGE(TAG_MAIN, "Receiver MAC seed failed: %s", esp_err_to_name(e));
+      }
+    }
     ESP_LOGI(TAG_MAIN, "NVS already provisioned. No seeding needed.");
     return;
   }
@@ -647,12 +692,12 @@ static void seed_nvs_if_empty(bool force_reset) {
   const char *DEF_PASS   = "YRUS90011";
 
   //JT-001
-  const char *DEF_UUID   = "e5db0a64-d476-4f5b-b080-736b150daad6";
-  const char *DEF_SECRET = "IHd0z7gevTOv1iB_fira42uAyF-Y2VZuVxZ7_xA90Kw";  //test
+  //const char *DEF_UUID   = "e5db0a64-d476-4f5b-b080-736b150daad6";
+  //const char *DEF_SECRET = "IHd0z7gevTOv1iB_fira42uAyF-Y2VZuVxZ7_xA90Kw";  //test
 
   //JT-002
-  //const char *DEF_UUID   = "af257216-660a-49ee-b443-71907ee0d4bf";
-  //const char *DEF_SECRET = "boHaGtcn3MX4MgSj1OzAO6W8_vjsqHQH2KU90vba55U";  //office
+  const char *DEF_UUID   = "af257216-660a-49ee-b443-71907ee0d4bf";
+  const char *DEF_SECRET = "boHaGtcn3MX4MgSj1OzAO6W8_vjsqHQH2KU90vba55U";  //office
 
   //JT-003
   //const char *DEF_UUID   = "bd02422c-0894-405b-b0bb-8c9ba02460b3";
@@ -668,6 +713,8 @@ static void seed_nvs_if_empty(bool force_reset) {
   strncpy(cfg.device_uuid, DEF_UUID, sizeof(cfg.device_uuid) - 1);
   strncpy(cfg.device_secret, DEF_SECRET, sizeof(cfg.device_secret) - 1);
   strncpy(cfg.api_base, DEF_API, sizeof(cfg.api_base) - 1);
+  memcpy(cfg.receiver_mac, DEF_RECEIVER_MAC, sizeof(cfg.receiver_mac));
+  cfg.receiver_mac_set = true;
   cfg.last_fw_id = -1;
 
   e = nvs_config_save(&cfg);
@@ -675,8 +722,10 @@ static void seed_nvs_if_empty(bool force_reset) {
     ESP_LOGE(TAG_MAIN, "NVS seed failed: %s", esp_err_to_name(e));
   } else {
     ESP_LOGW(TAG_MAIN,
-      "NVS seeded:\n  SSID=%s\n  UUID=%s\n  API=%s",
-      cfg.wifi_ssid, cfg.device_uuid, cfg.api_base);
+      "NVS seeded:\n  SSID=%s\n  UUID=%s\n  API=%s\n  receiver_mac=%02X:%02X:%02X:%02X:%02X:%02X",
+      cfg.wifi_ssid, cfg.device_uuid, cfg.api_base,
+      cfg.receiver_mac[0], cfg.receiver_mac[1], cfg.receiver_mac[2],
+      cfg.receiver_mac[3], cfg.receiver_mac[4], cfg.receiver_mac[5]);
   }
 }
 
@@ -1037,8 +1086,15 @@ static bool sha256_16(const char *input, uint8_t out16[16]) {
 }
 
 static bool espnow_derive_keys() {
-  if (!sha256_16(SHARED_UUID, espnow_pmk)) return false;
-  if (!sha256_16(SHARED_UUID, espnow_lmk)) return false;
+  device_config_t cfg{};
+  esp_err_t err = nvs_config_load(&cfg);
+  if (err != ESP_OK || !cfg.device_secret[0]) {
+    ESP_LOGE("ESPNOW", "Cannot derive keys: device_secret missing (%s)", esp_err_to_name(err));
+    return false;
+  }
+
+  if (!sha256_16(cfg.device_secret, espnow_pmk)) return false;
+  if (!sha256_16(cfg.device_secret, espnow_lmk)) return false;
   return true;
 }
 
@@ -1167,50 +1223,67 @@ static bool parse_mac_string(const char *s, uint8_t out[6]) {
   return true;
 }
 
-static void receiver_mac_to_string(char *out, size_t out_len) {
+static void mac_to_string(const uint8_t mac[6], char *out, size_t out_len) {
   snprintf(out, out_len,
            "%02X:%02X:%02X:%02X:%02X:%02X",
-           receiverMAC[0], receiverMAC[1], receiverMAC[2],
-           receiverMAC[3], receiverMAC[4], receiverMAC[5]);
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 static void save_receiver_mac_to_nvs() {
-  nvs_handle_t h;
-
-  if (nvs_open("espnow_cfg", NVS_READWRITE, &h) != ESP_OK) {
-    ESP_LOGE("ESPNOW", "Failed to open espnow_cfg NVS");
+  esp_err_t err = nvs_config_set_receiver_mac(receiverMAC);
+  if (err != ESP_OK) {
+    ESP_LOGE("ESPNOW", "Failed to save receiver MAC to NVS: %s", esp_err_to_name(err));
     return;
   }
-
-  nvs_set_blob(h, "receiver_mac", receiverMAC, 6);
-  nvs_commit(h);
-  nvs_close(h);
 
   ESP_LOGI("ESPNOW", "Receiver MAC saved to NVS");
 }
 
-static bool load_receiver_mac_from_nvs() {
+static bool load_legacy_receiver_mac_from_nvs(uint8_t out[6]) {
   nvs_handle_t h;
-
-  if (nvs_open("espnow_cfg", NVS_READONLY, &h) != ESP_OK) {
-    ESP_LOGW("ESPNOW", "No espnow_cfg NVS yet, using default receiverMAC");
+  esp_err_t err = nvs_open("espnow_cfg", NVS_READONLY, &h);
+  if (err != ESP_OK) {
     return false;
   }
 
   size_t len = 6;
-  esp_err_t err = nvs_get_blob(h, "receiver_mac", receiverMAC, &len);
+  err = nvs_get_blob(h, "receiver_mac", out, &len);
   nvs_close(h);
 
-  if (err != ESP_OK || len != 6) {
-    ESP_LOGW("ESPNOW", "No saved receiver MAC, using default");
+  return err == ESP_OK && len == 6;
+}
+
+static bool load_receiver_mac_from_nvs() {
+  if (s_receiver_mac_loaded) {
+    return true;
+  }
+
+  esp_err_t err = nvs_config_get_receiver_mac(receiverMAC);
+
+  if (err != ESP_OK) {
+    if (load_legacy_receiver_mac_from_nvs(receiverMAC)) {
+      s_receiver_mac_loaded = true;
+      ESP_LOGW("ESPNOW", "Migrating receiver MAC from legacy espnow_cfg namespace");
+      save_receiver_mac_to_nvs();
+      return true;
+    }
+
+    ESP_LOGE("ESPNOW", "No receiver MAC in NVS; run seed_nvs_if_empty or set_receiver_mac");
     return false;
   }
 
+  s_receiver_mac_loaded = true;
+
   char macStr[18];
-  receiver_mac_to_string(macStr, sizeof(macStr));
+  mac_to_string(receiverMAC, macStr, sizeof(macStr));
   ESP_LOGI("ESPNOW", "Loaded receiver MAC from NVS: %s", macStr);
 
   return true;
+}
+
+static void receiver_mac_to_string(char *out, size_t out_len) {
+  load_receiver_mac_from_nvs();
+  mac_to_string(receiverMAC, out, out_len);
 }
 
 static void on_ws_event(const char *type, const char *payload_command) {
@@ -1370,12 +1443,28 @@ static void on_ws_event(const char *type, const char *payload_command) {
         return;
       }
 
-      memcpy(receiverMAC, newMac, 6);
+      uint8_t oldMac[6];
+      memcpy(oldMac, receiverMAC, sizeof(oldMac));
+      memcpy(receiverMAC, newMac, sizeof(receiverMAC));
+      s_receiver_mac_loaded = true;
       save_receiver_mac_to_nvs();
 
       if (espnow_initialized) {
-        esp_now_del_peer(receiverMAC);
-        espnow_initialized = false;
+        if (esp_now_is_peer_exist(oldMac)) {
+          esp_now_del_peer(oldMac);
+        }
+
+        esp_now_peer_info_t peerInfo = {};
+        memcpy(peerInfo.peer_addr, receiverMAC, ESP_NOW_ETH_ALEN);
+        peerInfo.channel = 0;
+        peerInfo.ifidx = WIFI_IF_STA;
+        peerInfo.encrypt = true;
+        memcpy(peerInfo.lmk, espnow_lmk, 16);
+
+        if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+          ESP_LOGE("ESPNOW", "Failed to add updated receiver peer");
+          espnow_initialized = false;
+        }
       }
 
       char macStr[18];
@@ -2019,9 +2108,10 @@ static void login_task(void *p) {
   esp_err_t e = wait_for_ip(60000);
   if (e != ESP_OK) {
     ESP_LOGE(TAG_MAIN, "No IP, login aborted (%s)", esp_err_to_name(e));
+    g_backend_running = false;
     g_login_inflight = false;
+    xTaskCreatePinnedToCore(relogin_retry_task, "relogin_retry", 4096, (void *)5000, 4, NULL, 0);
     vTaskDelete(NULL);
-    ESP.restart();
     return;
   }
 
@@ -2030,6 +2120,7 @@ static void login_task(void *p) {
       !nvs_config_has_identity(&cfg) ||
       !nvs_config_has_api_base(&cfg)) {
     ESP_LOGW(TAG_MAIN, "Missing or invalid config; login aborted");
+    g_backend_running = false;
     g_login_inflight = false;
     vTaskDelete(NULL);
     return;
@@ -2057,7 +2148,9 @@ static void login_task(void *p) {
 
   strncpy(g_ctx.api_base, cfg.api_base, sizeof(g_ctx.api_base) - 1);
   strncpy(g_ctx.device_uuid, cfg.device_uuid, sizeof(g_ctx.device_uuid) - 1);
+  strncpy(g_ctx.device_secret, cfg.device_secret, sizeof(g_ctx.device_secret) - 1);
   strncpy(g_ctx.token, token, sizeof(g_ctx.token) - 1);
+  access_log_service_set_context(g_ctx.api_base, g_ctx.device_uuid, g_ctx.device_secret, g_ctx.token);
 
   ESP_LOGI(TAG_MAIN, "Login OK (token_len=%u)", (unsigned)strlen(g_ctx.token));
 
@@ -2067,6 +2160,43 @@ static void login_task(void *p) {
   g_backend_running = true;
   g_login_inflight = false;
   vTaskDelete(NULL);
+}
+
+static bool is_clock_reliable() {
+  time_t now = time(NULL);
+  return now > 1600000000;
+}
+
+static bool access_log_backend_ready()
+{
+  return !g_espnow_busy &&
+         g_backend_running &&
+         ws_client_is_connected() &&
+         g_ctx.api_base[0] != 0 &&
+         g_ctx.device_uuid[0] != 0 &&
+         g_ctx.token[0] != 0 &&
+         g_ctx.device_secret[0] != 0;
+}
+
+static void access_log_request_backend_start()
+{
+  if (!g_espnow_busy && g_backend_ev && !g_backend_running) {
+    xEventGroupSetBits(g_backend_ev, BACKEND_START_BIT);
+  }
+}
+
+static void queue_lock_access_log(const std::string &uid, const char *result, const char *reason)
+{
+  esp_err_t err = access_log_service_enqueue(
+      uid.c_str(),
+      result,
+      reason,
+      !is_clock_reliable());
+
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG_MAIN, "Queue access log failed uid=%s result=%s err=%s",
+             uid.c_str(), result, esp_err_to_name(err));
+  }
 }
 
 static void request_relogin(void){
@@ -2099,12 +2229,15 @@ static void backend_task(void *arg)
 
         if (bits & BACKEND_START_BIT) {
             if (!g_backend_running && !g_espnow_busy) {
-                ESP_LOGI("BACKEND", "Starting backend");
+                if (g_login_inflight) {
+                    ESP_LOGI("BACKEND", "Backend login already starting");
+                } else {
+                    ESP_LOGI("BACKEND", "Starting backend");
+                }
 
                 ws_client_set_relogin_cb(request_relogin);
 
                 request_relogin();   // login + WS start
-                g_backend_running = true;
             } else {
                 ESP_LOGW("BACKEND", "Start ignored, already running");
             }
@@ -2187,6 +2320,9 @@ std::vector<std::string> listUIDs()
 
     nvs_handle_t nvs_handle;
     esp_err_t err = nvs_open("my-app", NVS_READONLY, &nvs_handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return out;
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG_NVS, "Error opening NVS handle (%s)", esp_err_to_name(err));
         return out;
@@ -2533,8 +2669,11 @@ bool isUIDStored(const std::string& uid) {
   // Initialize NVS
   nvs_handle_t nvs_handle;
   esp_err_t err = nvs_open("my-app", NVS_READONLY, &nvs_handle);
+  if (err == ESP_ERR_NVS_NOT_FOUND) {
+      return false;
+  }
   if (err != ESP_OK) {
-      ESP_LOGE("NVS", "Error opening NVS handle!");
+      ESP_LOGE(TAG_NVS, "Error opening NVS handle (%s)", esp_err_to_name(err));
       return false;
   }
 
@@ -2556,8 +2695,11 @@ bool isUIDStored(const std::string& uid) {
 
       // Get the length of the stored UID
       err = nvs_get_str(nvs_handle, key.c_str(), nullptr, &len);
+      if (err == ESP_ERR_NVS_NOT_FOUND) {
+          continue;
+      }
       if (err != ESP_OK) {
-          ESP_LOGE("NVS", "Failed to get length of stored UID");
+          ESP_LOGW(TAG_NVS, "Failed to get length of stored UID %s (%s)", key.c_str(), esp_err_to_name(err));
           continue;
       }
 
@@ -2588,6 +2730,9 @@ bool isUIDDeactivated(const std::string& uid)
 {
     nvs_handle_t h;
     esp_err_t err = nvs_open("my-app", NVS_READONLY, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return false;
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG_DEACT, "nvs_open failed (%s)", esp_err_to_name(err));
         return false;
@@ -2684,7 +2829,9 @@ static bool espnow_init_once() {
 
 static void espnow_task_entry(void *arg) {
   ESP_LOGI("ESPNOW", "Task started");
-  load_receiver_mac_from_nvs();
+  while (!load_receiver_mac_from_nvs()) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
 
   while (!espnow_init_once()) {
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -2783,9 +2930,9 @@ void nfc_retry(void* arg) {
       int min = (versiondata >> 8) & 0xFF;
       ESP_LOGI("NFC_SETUP", "Firmware ver. %d.%d", maj, min);
 
-      nfc->SAMConfig();
-      nfc->setRFField(0x02, 0x01);
-      nfc->setPassiveActivationRetries(0);
+      if (!configure_nfc_for_detection()) {
+        ESP_LOGW("NFC_SETUP", "PN532 detection tuning returned an error");
+      }
 
       ESP_LOGI("NFC_SETUP", "Waiting for an ISO14443A card");
 
@@ -2801,7 +2948,7 @@ void nfc_retry(void* arg) {
 
 
 void nfc_thread_entry(void* arg) {
-  uint32_t versiondata = nfc->getFirmwareVersion();if (!versiondata) {ESP_LOGE("NFC_SETUP", "Error establishing PN532 connection");nfc->stop();xTaskCreatePinnedToCore(nfc_retry, "nfc_reconnect_task", 8192, NULL, 10, &nfc_reconnect_task, 0);evtlog_push(EVT_NFC_FAIL);app_task_register(nfc_reconnect_task, true);vTaskSuspend(NULL);} else {unsigned int model = (versiondata >> 24) & 0xFF;ESP_LOGI("NFC_SETUP", "Found chip PN5%x", model);int maj = (versiondata >> 16) & 0xFF;int min = (versiondata >> 8) & 0xFF;ESP_LOGI("NFC_SETUP", "Firmware ver. %d.%d", maj, min);nfc->SAMConfig();nfc->setRFField(0x02, 0x01);nfc->setPassiveActivationRetries(0);ESP_LOGI("NFC_SETUP", "Waiting for an ISO14443A card");}
+  uint32_t versiondata = nfc->getFirmwareVersion();if (!versiondata) {ESP_LOGE("NFC_SETUP", "Error establishing PN532 connection");nfc->stop();xTaskCreatePinnedToCore(nfc_retry, "nfc_reconnect_task", 8192, NULL, 10, &nfc_reconnect_task, 0);evtlog_push(EVT_NFC_FAIL);app_task_register(nfc_reconnect_task, true);vTaskSuspend(NULL);} else {unsigned int model = (versiondata >> 24) & 0xFF;ESP_LOGI("NFC_SETUP", "Found chip PN5%x", model);int maj = (versiondata >> 16) & 0xFF;int min = (versiondata >> 8) & 0xFF;ESP_LOGI("NFC_SETUP", "Firmware ver. %d.%d", maj, min);if (!configure_nfc_for_detection()) {ESP_LOGW("NFC_SETUP", "PN532 detection tuning returned an error");}ESP_LOGI("NFC_SETUP", "Waiting for an ISO14443A card");}
 
   // Refresh ECP with GID + CRCif (readerData.reader_gid.size() > 0) {memcpy(ecpData + 8, readerData.reader_gid.data(), readerData.reader_gid.size());with_crc16(ecpData, 16, ecpData + 16);}
 
@@ -2810,7 +2957,7 @@ void nfc_thread_entry(void* arg) {
   uint8_t res[4];
   uint16_t resLen = 4;
 
-  bool writeStatus = nfc->writeRegister(0x633d, 0, true);
+  bool writeStatus = nfc->writeRegister(kPn532RfCfgRegister, kPn532RfCfgMaxReceiverGain, true);
   if (!writeStatus) {
     LOG(W, "writeRegister failed, reconnecting PN532");
     nfc->stop();
@@ -2827,12 +2974,12 @@ void nfc_thread_entry(void* arg) {
   uint8_t sak[1];
 
   bool passiveTarget = nfc->readPassiveTargetID(
-    PN532_MIFARE_ISO14443A, uid, &uidLen, atqa, sak, 500, true, true
+    PN532_MIFARE_ISO14443A, uid, &uidLen, atqa, sak, kPn532PassivePollTimeoutMs, true, true
   );
 
   if (passiveTarget) {
 
-    nfc->setPassiveActivationRetries(5);
+    nfc->setPassiveActivationRetries(kPn532PassiveActivationRetries);
 
     std::string detectedUID = red_log::bufToHexString(uid, uidLen);
 
@@ -2854,16 +3001,31 @@ void nfc_thread_entry(void* arg) {
 
     //ESP_LOGI("NFC_TAG", "Detected UID: %s", detectedUID.c_str());
 
+    if (nfc_uid_recently_handled(detectedUID)) {
+      nfc->inRelease();
+      vTaskDelay(20 / portTICK_PERIOD_MS);
+      continue;
+    }
+    mark_nfc_uid_handled(detectedUID);
+
+    bool uidStored = isUIDStored(detectedUID);
+    bool uidDeactivated = uidStored && isUIDDeactivated(detectedUID);
+    bool skipHomeKeySelect = false;
+
     // Optional UID whitelist unlock (non-HomeKey cards)
-    if (isUIDStored(detectedUID) && !isUIDDeactivated(detectedUID)) {
+    if (uidStored && !uidDeactivated) {
       ESP_LOGI("NFC", "UID found");
       //espnow_enqueue_text(detectedUID.c_str());
       espnow_enqueue_text("UNLOCK");
       beep_correct(true);
-    } else if((!isUIDStored(detectedUID) && !store_new_card) || isUIDDeactivated(detectedUID)){
+      queue_lock_access_log(detectedUID, "ALLOW", "matched_active_member");
+      skipHomeKeySelect = true;
+    } else if(uidDeactivated){
       beep_correct(false);
-      ESP_LOGI("NFC", "UID not found");
-    } else if (!isUIDStored(detectedUID) && store_new_card) {
+      ESP_LOGI("NFC", "UID deactivated");
+      queue_lock_access_log(detectedUID, "DENY", "deactivated_member");
+      skipHomeKeySelect = true;
+    } else if (!uidStored && store_new_card) {
         beep_short();
         set_ui_lights(true);
         addUID(detectedUID);   // still store locally if required
@@ -2874,6 +3036,15 @@ void nfc_thread_entry(void* arg) {
         store_new_card = false;
         beep_short();
         set_ui_lights(false);
+        skipHomeKeySelect = true;
+    } else {
+      ESP_LOGI("NFC", "UID not found; checking HomeKey applet");
+    }
+
+    if (skipHomeKeySelect) {
+      nfc->inRelease();
+      vTaskDelay(50 / portTICK_PERIOD_MS);
+      continue;
     }
 
     LOG(I, "*** PASSIVE TARGET DETECTED ***");
@@ -2907,7 +3078,6 @@ void nfc_thread_entry(void* arg) {
       auto authResult = authCtx.authenticate(hkFlow);
 
       if (std::get<2>(authResult) != kFlowFailed) {
-
         espnow_enqueue_text("UNLOCK");
         ESP_LOGI("ESPNOW", "HomeKey UID sent via ESP-NOW: %s", detectedUID.c_str());
 
@@ -2933,31 +3103,21 @@ void nfc_thread_entry(void* arg) {
         auto stopTime = std::chrono::high_resolution_clock::now();
         LOG(I, "Total Time (detection->auth->gpio): %lli ms",
             (long long)std::chrono::duration_cast<std::chrono::milliseconds>(stopTime - startTime).count());
+        queue_lock_access_log(detectedUID, "ALLOW", "matched_active_member");
 
       } else {
         LOG(W, "HomeKey auth failed (FlowFailed)");
+        queue_lock_access_log(detectedUID, "DENY", "homekey_auth_failed");
       }
 
       nfc->setRFField(0x02, 0x01);
 
     } else {
       LOG(W, "Not a HomeKey tag (SELECT failed) UID=%s", detectedUID.c_str());
-    }
-
-    vTaskDelay(50 / portTICK_PERIOD_MS);
-    nfc->inRelease();
-
-    // Wait until tag leaves field (anti-repeat)
-    int counter = 50;
-    bool deviceStillInField = nfc->readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen);
-    while (deviceStillInField && counter-- > 0) {
-      vTaskDelay(50 / portTICK_PERIOD_MS);
-      nfc->inRelease();
-      deviceStillInField = nfc->readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen);
+      queue_lock_access_log(detectedUID, "DENY", "not_homekey");
     }
 
     nfc->inRelease();
-    nfc->setPassiveActivationRetries(0);
   }
 
   vTaskDelay(50 / portTICK_PERIOD_MS);
@@ -3489,6 +3649,12 @@ void setup() {
   homeSpan.setControllerCallback(pairCallback);
   homeSpan.setConnectionCallback(wifiCallback);
   ota_mark_valid_if_pending_verify();
+
+  g_backend_ev = xEventGroupCreate();
+  esp_err_t alog_err = access_log_service_start(access_log_backend_ready, access_log_request_backend_start);
+  if (alog_err != ESP_OK) {
+    ESP_LOGW(TAG_MAIN, "access_log_service_start failed: %s", esp_err_to_name(alog_err));
+  }
   
   if (espConfig::miscConfig.gpioActionPin != 255 || espConfig::miscConfig.hkDumbSwitchMode) {
     xTaskCreatePinnedToCore(gpio_task, "gpio_task", 4096, NULL, 5, &gpio_lock_task_handle, 0);
@@ -3503,7 +3669,6 @@ void setup() {
   xTaskCreatePinnedToCore(mpr121_task_entry, "mpr121_task", 6144, NULL, 1, &mpr121_task_handle, 1);
   //app_task_register(mpr121_task_handle, true);
   monitor_stop();
-  g_backend_ev = xEventGroupCreate();
   xTaskCreatePinnedToCore(backend_task, "backend_task", 8192, NULL, 5, NULL, 0);
 
   xTaskCreatePinnedToCore(ws_keepalive_task_fn, "ws_keepalive", 4096, NULL, 4, &g_ws_keepalive_task, 0);

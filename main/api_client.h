@@ -1,7 +1,8 @@
 #pragma once
 #include <stddef.h>
+#include <stdbool.h>
 #include "esp_err.h"
-#include "esp_http_client.h" 
+#include "esp_http_client.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,13 +33,28 @@ esp_err_t api_get_firmware_list_json(const char *api_base,
                                     const char *bearer_token,
                                     char **out_json,
                                     int *out_len);
-                                  
+
 
 esp_err_t api_get_firmware_by_id(const char *api_base,
                                  const char *device_uuid,
                                  const char *bearer_token,
                                  int fw_id,
                                  firmware_info_t *out_fw);
+
+esp_err_t api_post_lock_access_log(const char *api_base,
+                                  const char *device_uuid,
+                                  char *bearer_token,
+                                  size_t bearer_token_len,
+                                  const char *device_secret,
+                                  const char *card_number,
+                                  const char *result,
+                                  const char *direction,
+                                  const char *source,
+                                  const char *reason,
+                                  const char *uid,
+                                  const char *ts_utc,
+                                  bool omit_ts,
+                                  bool *out_known_member);
 
 #ifdef __cplusplus
 }

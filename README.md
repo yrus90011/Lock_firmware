@@ -57,6 +57,83 @@ This fork targets an ESP32-based lock controller with HomeKey NFC, an MPR121 cap
 | `ota_client_start_by_id()` | `main/ota_client.c` | Starts OTA for a firmware ID received from the backend. |
 | `evtlog_push()` | `main/evtlog.c` | Records failure/event counters from NFC, MPR121, websocket, and related code paths. |
 
+### Backend Websocket Commands
+
+`main/ws_client.c` accepts text JSON websocket frames and forwards commands to `on_ws_event()` in `main/main.cpp`.
+
+Supported inbound command envelopes:
+
+```json
+{"type":"event","payload":{"command":"ping"}}
+```
+
+```json
+{"type":"command","payload":{"command":"ping"}}
+```
+
+```json
+{"type":"signal","payload":{"type":"ping"}}
+```
+
+`type: "live"` is a keepalive acknowledgement. It resets the websocket miss counter and does not require a payload command.
+
+Most command handlers use a simple string prefix check. Send the canonical forms below to avoid accidental matches.
+
+| Command | Example payload command | Purpose / response |
+| --- | --- | --- |
+| `ping` | `ping` | Replies with `{"response":"pong"}`. |
+| `ota_update` | `ota_update, fw=1` | Starts OTA using backend firmware ID `fw`. Replies with `ota_result` statuses. |
+| `fw_list` | `fw_list` | Fetches available firmware from the backend and sends `fw_list_result`. |
+| `version` | `version` | Sends an OK event with command `printf_test, version=2.5`. |
+| `evtlog_get` | `evtlog_get` | Sends event-log counters such as boot count, websocket disconnects, NFC failures, and MPR121 failures. |
+| `monitor_task` | `monitor_task` | Sends one monitor snapshot with heap and task diagnostics. |
+| `monitor_start` | `monitor_start` or `monitor_start 30000` | Starts monitor collection. Optional timeout is milliseconds; default is `15000`. |
+| `monitor_stop` | `monitor_stop` | Stops monitor collection. |
+| `add_new_card` | `add_new_card` | Arms the next detected card to be stored. |
+| `request_card_number` | `request_card_number` | Same behavior as `add_new_card`. |
+| `uids_list` | `uids_list` | Sends stored card UIDs. |
+| `delete_uid` | `delete_uid,uid=04AABBCC` | Deletes a stored UID. The `uid=` value ends at comma or newline. |
+| `deactivate` | `deactivate,uid=04AABBCC` | Deactivates a stored UID. |
+| `activate` | `activate,uid=04AABBCC` | Reactivates a stored UID. |
+| `get_mac` | `get_mac` | Sends the ESP32 Wi-Fi STA MAC address. |
+| `get_receiver_mac` | `get_receiver_mac` | Sends the configured ESP-NOW receiver MAC. |
+| `set_receiver_mac` | `set_receiver_mac AA:BB:CC:DD:EE:FF` | Saves a new ESP-NOW receiver MAC. Separators after the command may be space, tab, comma, or `=`. |
+| `get_wifi_channel` | `get_wifi_channel` | Sends the current Wi-Fi primary channel. |
+| `get_wifi_rssi` | `get_wifi_rssi` | Sends current Wi-Fi RSSI. |
+| `wifi_disconnect` | `wifi_disconnect` | Disconnects the STA interface from the AP. |
+| `send_via_esp` | `send_via_esp UNLOCK` | Queues a text payload for ESP-NOW. |
+| `espnow_blast` | `espnow_blast UNLOCK` | Starts an async ESP-NOW blast task with the provided payload. |
+| `reboot` | `reboot` | Sends OK, waits briefly, then restarts the ESP32. |
+| `start_config_ap` | `start_config_ap` | Runs the HomeSpan `A` command to start the config AP. |
+| `reset_hk_pair` | `reset_hk_pair` | Deletes reader data and runs the HomeSpan `H` command. |
+| `reset_wifi_cred` | `reset_wifi_cred` | Runs the HomeSpan `X` command to clear Wi-Fi credentials. |
+| `get_misc` | `get_misc` | Sends the current misc config object. |
+| `save_misc` | `save_misc,{"deviceName":"Front Door"}` | Applies and persists a partial misc config object, then restarts. |
+| `clear_misc` | `clear_misc` | Erases saved misc config from NVS and resets in-memory misc config to defaults. |
+| `get_hkinfo` | `get_hkinfo` | Sends serialized HomeKey reader identifiers and issuer endpoint IDs. |
+
+`save_misc` accepts only keys already present in the misc config. Known keys include `deviceName`, `otaPasswd`, `hk_key_color`, `setupCode`, `lockAlwaysUnlock`, `lockAlwaysLock`, `controlPin`, `hsStatusPin`, `gpioActionPin`, `gpioActionLockState`, `gpioActionUnlockState`, `gpioActionMomentaryEnabled`, `gpioActionMomentaryTimeout`, `webAuthEnabled`, `webUsername`, `webPassword`, `nfcGpioPins`, `btrLowStatusThreshold`, `proxBatEnabled`, `hkDumbSwitchMode`, `hkAltActionInitPin`, `hkAltActionInitLedPin`, `hkAltActionInitTimeout`, `hkAltActionPin`, `hkAltActionTimeout`, `hkAltActionGpioState`, and `hkGpioControlledState`.
+
+Useful command examples:
+
+```json
+{"type":"event","payload":{"command":"ota_update, fw=12"}}
+```
+
+```json
+{"type":"command","payload":{"command":"save_misc,{\"webAuthEnabled\":true,\"webUsername\":\"admin\"}"}}
+```
+
+```json
+{"type":"event","payload":{"command":"set_receiver_mac=AA:BB:CC:DD:EE:FF"}}
+```
+
+```json
+{"type":"event","payload":{"command":"send_via_esp UNLOCK"}}
+```
+
+`ws_client.c` also routes websocket log-upload acknowledgements directly to `main/ws_log_upload.c`, not to `on_ws_event()`. Those inbound message types are `log_upload_ready`, `log_upload_done`, and `log_upload_error`; device-originated upload messages are `log_upload_begin`, `log_upload_chunk`, and `log_upload_end`.
+
 ### Pin Configuration
 
 Current ESP32 hardware pin map:
@@ -134,6 +211,7 @@ Expected useful boot logs:
 
 ```text
 NFC_SETUP: PN532 SPI pins: SS=5 SCK=18 MISO=19 MOSI=23
+NFC_SETUP: PN532 tuned: passive retries=0xFF poll timeout=1000 ms
 MPR121: CONFIG_I2C_ADDRESS=0x5A
 MPR121: CONFIG_SCL_GPIO=22
 MPR121: CONFIG_SDA_GPIO=21
@@ -141,6 +219,8 @@ MPR121: CONFIG_IRQ_GPIO=15
 ```
 
 If PN532 does not answer, first verify the module is in SPI mode and wired to GPIO5/18/19/23. If MPR121 shows repeated `i2c_getRegister` or `i2c_setRegister` failures, verify SDA/SCL are on GPIO21/GPIO22, the address is `0x5A`, and the breakout has working I2C pullups.
+
+PN532 detection range is primarily limited by the antenna/module, tag/phone coil alignment, power stability, and nearby metal. The firmware keeps passive activation retries at `0xFF` and uses a 1000 ms passive poll timeout to improve marginal reads, but larger gains usually require moving the antenna away from metal, using a larger PN532 antenna, or adding a ferrite sheet behind the coil.
 
 ## Disclaimer
 

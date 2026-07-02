@@ -8,6 +8,7 @@ idf_component_register(
         "task_control.c"
         "evtlog.c"
         "ws_log_upload.c"
+        "access_log_service.c"
         "main.cpp"
     INCLUDE_DIRS "include"
     REQUIRES 

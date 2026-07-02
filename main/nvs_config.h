@@ -1,6 +1,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -16,6 +17,7 @@ extern "C" {
 #define NVS_KEY_API     "api_base"
 #define NVS_KEY_LAST_FW "last_fw_id"
 #define NVS_KEY_PIN "pin"
+#define NVS_KEY_RECEIVER_MAC "receiver_mac"
 
 typedef struct {
     char wifi_ssid[33];
@@ -23,6 +25,8 @@ typedef struct {
     char device_uuid[64];     // UUID string
     char device_secret[128];  // allow longer secrets
     char api_base[192];       // "https://host"
+    uint8_t receiver_mac[6];  // ESP-NOW receiver peer
+    bool receiver_mac_set;
     int  last_fw_id;          // -1 if none
 } device_config_t;
 
@@ -38,6 +42,9 @@ esp_err_t nvs_config_get_last_fw_id(int *out_fw_id);
 
 esp_err_t nvs_config_get_pin(char *out_pin, size_t out_sz);
 esp_err_t nvs_config_set_pin(const char *pin);
+
+esp_err_t nvs_config_get_receiver_mac(uint8_t out_mac[6]);
+esp_err_t nvs_config_set_receiver_mac(const uint8_t mac[6]);
 
 
 #ifdef __cplusplus

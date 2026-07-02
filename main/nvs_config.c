@@ -1,5 +1,6 @@
 #include "nvs_config.h"
 #include <string.h>
+#include <stdlib.h>
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
@@ -61,13 +62,22 @@ esp_err_t nvs_config_load(device_config_t *out) {
         out->last_fw_id = (int)fw;
     }
 
+    size_t mac_len = sizeof(out->receiver_mac);
+    if (nvs_get_blob(h, NVS_KEY_RECEIVER_MAC, out->receiver_mac, &mac_len) == ESP_OK &&
+        mac_len == sizeof(out->receiver_mac)) {
+        out->receiver_mac_set = true;
+    }
+
     nvs_close(h);
 
-    ESP_LOGI(TAG, "Loaded: ssid=%s uuid=%s api_base=%s last_fw_id=%d",
+    ESP_LOGI(TAG, "Loaded: ssid=%s uuid=%s api_base=%s last_fw_id=%d receiver_mac=%s%02X:%02X:%02X:%02X:%02X:%02X",
              out->wifi_ssid[0] ? out->wifi_ssid : "(missing)",
              out->device_uuid[0] ? out->device_uuid : "(missing)",
              out->api_base[0] ? out->api_base : "(missing)",
-             out->last_fw_id);
+             out->last_fw_id,
+             out->receiver_mac_set ? "" : "(missing) ",
+             out->receiver_mac[0], out->receiver_mac[1], out->receiver_mac[2],
+             out->receiver_mac[3], out->receiver_mac[4], out->receiver_mac[5]);
 
     return ESP_OK;
 }
@@ -84,6 +94,7 @@ esp_err_t nvs_config_save(const device_config_t *cfg) {
     if (cfg->device_uuid[0]) ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_set_str_safe(h, NVS_KEY_UUID, cfg->device_uuid));
     if (cfg->device_secret[0]) ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_set_str_safe(h, NVS_KEY_SECRET, cfg->device_secret));
     if (cfg->api_base[0])    ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_set_str_safe(h, NVS_KEY_API, cfg->api_base));
+    if (cfg->receiver_mac_set) ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_set_blob(h, NVS_KEY_RECEIVER_MAC, cfg->receiver_mac, sizeof(cfg->receiver_mac)));
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_set_i32(h, NVS_KEY_LAST_FW, (int32_t)cfg->last_fw_id));
 
@@ -182,6 +193,48 @@ esp_err_t nvs_config_set_pin(const char *pin) {
     }
 
     err = nvs_set_str_safe(h, NVS_KEY_PIN, pin);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t nvs_config_get_receiver_mac(uint8_t out_mac[6]) {
+    if (!out_mac) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS_DEVICE, NVS_READONLY, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    size_t len = 6;
+    err = nvs_get_blob(h, NVS_KEY_RECEIVER_MAC, out_mac, &len);
+    nvs_close(h);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return len == 6 ? ESP_OK : ESP_ERR_INVALID_SIZE;
+}
+
+esp_err_t nvs_config_set_receiver_mac(const uint8_t mac[6]) {
+    if (!mac) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS_DEVICE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_blob(h, NVS_KEY_RECEIVER_MAC, mac, 6);
     if (err == ESP_OK) {
         err = nvs_commit(h);
     }
