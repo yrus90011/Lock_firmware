@@ -105,8 +105,11 @@ static const char *TAG_DEACT = "NVS_DEACT";
 
 static bool g_backend_started = false;
 static bool g_login_inflight = false;
+static bool g_bootstrap_mode = false;
 
 static void request_relogin(void);
+static void relogin_retry_task(void *arg);
+static void bootstrap_reconnect_task(void *arg);
 
 void printWifiChannel(const char *tag) {
   wifi_second_chan_t second;
@@ -648,7 +651,7 @@ static esp_err_t wait_for_ip(uint32_t timeout_ms) {
 
 static void reset_device_nvs(void) {
   nvs_handle_t h;
-  if (nvs_open("device_cfg", NVS_READWRITE, &h) == ESP_OK) {
+  if (nvs_open(NVS_NS_DEVICE, NVS_READWRITE, &h) == ESP_OK) {
     nvs_erase_all(h);
     nvs_commit(h);
     nvs_close(h);
@@ -667,7 +670,6 @@ static void seed_nvs_if_empty(bool force_reset) {
   bool need_seed = force_reset ||
                    (e != ESP_OK) ||
                    !nvs_config_has_wifi(&cfg) ||
-                   !nvs_config_has_identity(&cfg) ||
                    !nvs_config_has_api_base(&cfg);
 
   if (!need_seed) {
@@ -691,27 +693,12 @@ static void seed_nvs_if_empty(bool force_reset) {
   const char *DEF_SSID   = "YRUS90011";
   const char *DEF_PASS   = "YRUS90011";
 
-  //JT-001
-  //const char *DEF_UUID   = "e5db0a64-d476-4f5b-b080-736b150daad6";
-  //const char *DEF_SECRET = "IHd0z7gevTOv1iB_fira42uAyF-Y2VZuVxZ7_xA90Kw";  //test
-
-  //JT-002
-  const char *DEF_UUID   = "af257216-660a-49ee-b443-71907ee0d4bf";
-  const char *DEF_SECRET = "boHaGtcn3MX4MgSj1OzAO6W8_vjsqHQH2KU90vba55U";  //office
-
-  //JT-003
-  //const char *DEF_UUID   = "bd02422c-0894-405b-b0bb-8c9ba02460b3";
-  //const char *DEF_SECRET = "1BHWXoYeke6igsuOzLGetu5mU8YrHiOoi4ztYP5EauU";  //shubh
-
-  
   //const char *DEF_API    = "https://api.junotech.com.np";
   const char *DEF_API    = "https://api.junotechnologies.com.np";
 
   memset(&cfg, 0, sizeof(cfg));
   strncpy(cfg.wifi_ssid, DEF_SSID, sizeof(cfg.wifi_ssid) - 1);
   strncpy(cfg.wifi_pass, DEF_PASS, sizeof(cfg.wifi_pass) - 1);
-  strncpy(cfg.device_uuid, DEF_UUID, sizeof(cfg.device_uuid) - 1);
-  strncpy(cfg.device_secret, DEF_SECRET, sizeof(cfg.device_secret) - 1);
   strncpy(cfg.api_base, DEF_API, sizeof(cfg.api_base) - 1);
   memcpy(cfg.receiver_mac, DEF_RECEIVER_MAC, sizeof(cfg.receiver_mac));
   cfg.receiver_mac_set = true;
@@ -722,8 +709,8 @@ static void seed_nvs_if_empty(bool force_reset) {
     ESP_LOGE(TAG_MAIN, "NVS seed failed: %s", esp_err_to_name(e));
   } else {
     ESP_LOGW(TAG_MAIN,
-      "NVS seeded:\n  SSID=%s\n  UUID=%s\n  API=%s\n  receiver_mac=%02X:%02X:%02X:%02X:%02X:%02X",
-      cfg.wifi_ssid, cfg.device_uuid, cfg.api_base,
+      "NVS seeded:\n  SSID=%s\n  API=%s\n  bootstrap_id=%s\n  receiver_mac=%02X:%02X:%02X:%02X:%02X:%02X",
+      cfg.wifi_ssid, cfg.api_base, FACTORY_BOOTSTRAP_ID,
       cfg.receiver_mac[0], cfg.receiver_mac[1], cfg.receiver_mac[2],
       cfg.receiver_mac[3], cfg.receiver_mac[4], cfg.receiver_mac[5]);
   }
@@ -1286,7 +1273,124 @@ static void receiver_mac_to_string(char *out, size_t out_len) {
   mac_to_string(receiverMAC, out, out_len);
 }
 
+static const char *json_get_string_from_root_or_payload(cJSON *root, const char *key)
+{
+  cJSON *item = cJSON_GetObjectItem(root, key);
+  if (cJSON_IsString(item) && item->valuestring) {
+    return item->valuestring;
+  }
+
+  cJSON *payload = cJSON_GetObjectItem(root, "payload");
+  if (cJSON_IsObject(payload)) {
+    item = cJSON_GetObjectItem(payload, key);
+    if (cJSON_IsString(item) && item->valuestring) {
+      return item->valuestring;
+    }
+  }
+
+  return NULL;
+}
+
+static void send_bootstrap_request()
+{
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+
+  char hw_mac[18];
+  mac_to_string(mac, hw_mac, sizeof(hw_mac));
+
+  std::string hw_serial = platform_create_id_string();
+
+  cJSON *root = cJSON_CreateObject();
+  if (!root) return;
+
+  cJSON_AddStringToObject(root, "type", "bootstrap_request");
+  cJSON_AddStringToObject(root, "message_type", "bootstrap_request");
+  cJSON_AddStringToObject(root, "bootstrap_id", FACTORY_BOOTSTRAP_ID);
+  cJSON_AddStringToObject(root, "bootstrap_secret", FACTORY_BOOTSTRAP_SECRET);
+  cJSON_AddStringToObject(root, "hw_mac", hw_mac);
+  cJSON_AddStringToObject(root, "hw_serial", hw_serial.c_str());
+
+  char *txt = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+
+  if (txt) {
+    ESP_LOGI(TAG_MAIN, "Sending bootstrap_request hw_mac=%s", hw_mac);
+    (void)ws_client_send_text(txt);
+    free(txt);
+  }
+}
+
+static bool save_bootstrap_response(const char *json)
+{
+  cJSON *root = cJSON_Parse(json);
+  if (!root) return false;
+
+  const char *uuid = json_get_string_from_root_or_payload(root, "device_uuid");
+  const char *secret = json_get_string_from_root_or_payload(root, "device_secret");
+  const char *receiver_mac_str = json_get_string_from_root_or_payload(root, "receiver_mac");
+  const char *api_base = json_get_string_from_root_or_payload(root, "api_base");
+
+  if (!uuid || !uuid[0] || !secret || !secret[0]) {
+    ESP_LOGW(TAG_MAIN, "bootstrap_response missing device_uuid/device_secret");
+    cJSON_Delete(root);
+    return false;
+  }
+
+  device_config_t cfg{};
+  esp_err_t err = nvs_config_load(&cfg);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG_MAIN, "Cannot save bootstrap response; config load failed: %s", esp_err_to_name(err));
+    cJSON_Delete(root);
+    return false;
+  }
+
+  strncpy(cfg.device_uuid, uuid, sizeof(cfg.device_uuid) - 1);
+  cfg.device_uuid[sizeof(cfg.device_uuid) - 1] = 0;
+  strncpy(cfg.device_secret, secret, sizeof(cfg.device_secret) - 1);
+  cfg.device_secret[sizeof(cfg.device_secret) - 1] = 0;
+  if (api_base && api_base[0]) {
+    strncpy(cfg.api_base, api_base, sizeof(cfg.api_base) - 1);
+    cfg.api_base[sizeof(cfg.api_base) - 1] = 0;
+  }
+  cfg.bootstrap_used = true;
+
+  if (receiver_mac_str && receiver_mac_str[0]) {
+    uint8_t new_mac[6];
+    if (parse_mac_string(receiver_mac_str, new_mac)) {
+      memcpy(cfg.receiver_mac, new_mac, sizeof(cfg.receiver_mac));
+      cfg.receiver_mac_set = true;
+      memcpy(receiverMAC, new_mac, sizeof(receiverMAC));
+      s_receiver_mac_loaded = true;
+    } else {
+      ESP_LOGW(TAG_MAIN, "bootstrap_response receiver_mac invalid: %s", receiver_mac_str);
+    }
+  }
+
+  err = nvs_config_save(&cfg);
+  cJSON_Delete(root);
+
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG_MAIN, "Failed to save provisioned credentials: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  strncpy(g_ctx.device_uuid, cfg.device_uuid, sizeof(g_ctx.device_uuid) - 1);
+  strncpy(g_ctx.device_secret, cfg.device_secret, sizeof(g_ctx.device_secret) - 1);
+  strncpy(g_ctx.api_base, cfg.api_base, sizeof(g_ctx.api_base) - 1);
+
+  ESP_LOGW(TAG_MAIN, "Device provisioned from bootstrap_response; reconnecting operational session");
+  return true;
+}
+
 static void on_ws_event(const char *type, const char *payload_command) {
+
+      if (type && strcmp(type, "connected") == 0) {
+        if (g_bootstrap_mode) {
+          send_bootstrap_request();
+        }
+        return;
+      }
 
       if (type && strcmp(type, "live") == 0) {
         g_live_miss_count = 0;
@@ -1296,6 +1400,26 @@ static void on_ws_event(const char *type, const char *payload_command) {
     }
 
   if (!payload_command || payload_command[0] == 0) return;
+
+  if (type && (strcmp(type, "bootstrap_response") == 0 || strcmp(type, "provisioning_update") == 0)) {
+    if (save_bootstrap_response(payload_command)) {
+      g_bootstrap_mode = false;
+      g_backend_running = false;
+      g_login_inflight = false;
+      xTaskCreatePinnedToCore(bootstrap_reconnect_task, "bootstrap_reconnect", 4096, NULL, 4, NULL, 0);
+    }
+    return;
+  }
+
+  if (type && strcmp(type, "auth_failure") == 0) {
+    ESP_LOGW(TAG_MAIN, "Backend auth_failure: %s", payload_command);
+    return;
+  }
+
+  if (type && strcmp(type, "auth_success") == 0) {
+    ESP_LOGI(TAG_MAIN, "Backend auth_success");
+    return;
+  }
   
   // ---------------- OTA command ----------------
   int fw_id = 0;
@@ -2059,6 +2183,9 @@ static void ws_start_task(void *p) {
 
   if (e != ESP_OK) {
     ESP_LOGE(TAG_WS, "ws_client_start failed: %s", esp_err_to_name(e));
+    g_backend_running = false;
+    g_login_inflight = false;
+    xTaskCreatePinnedToCore(relogin_retry_task, "relogin_retry", 4096, (void *)5000, 4, NULL, 0);
     vTaskDelete(NULL);
     return;
   }
@@ -2102,6 +2229,16 @@ static void relogin_retry_task(void *arg)
     vTaskDelete(NULL);
 }
 
+static void bootstrap_reconnect_task(void *arg)
+{
+    (void)arg;
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ws_client_stop();
+
+    vTaskDelete(NULL);
+}
+
 static void login_task(void *p) {
   (void)p;
 
@@ -2116,17 +2253,31 @@ static void login_task(void *p) {
   }
 
   device_config_t cfg{};
-  if (nvs_config_load(&cfg) != ESP_OK ||
-      !nvs_config_has_identity(&cfg) ||
-      !nvs_config_has_api_base(&cfg)) {
-    ESP_LOGW(TAG_MAIN, "Missing or invalid config; login aborted");
+  if (nvs_config_load(&cfg) != ESP_OK || !nvs_config_has_api_base(&cfg)) {
+    ESP_LOGW(TAG_MAIN, "Missing API config; login aborted");
     g_backend_running = false;
     g_login_inflight = false;
     vTaskDelete(NULL);
     return;
   }
 
+  if (!nvs_config_has_identity(&cfg)) {
+    ESP_LOGW(TAG_MAIN, "No device identity; entering BOOTSTRAP mode");
+
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    strncpy(g_ctx.api_base, cfg.api_base, sizeof(g_ctx.api_base) - 1);
+    g_bootstrap_mode = true;
+
+    xTaskCreatePinnedToCore(ws_start_task, "ws_bootstrap", 8192, NULL, 4, NULL, 0);
+
+    g_backend_running = true;
+    g_login_inflight = false;
+    vTaskDelete(NULL);
+    return;
+  }
+
   LOG(I, "LOGIN here:");
+  g_bootstrap_mode = false;
   app_tasks_suspend_all();
   (void)esp_wifi_set_ps(WIFI_PS_NONE);
   force_dns("1.1.1.1");

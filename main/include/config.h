@@ -68,6 +68,8 @@ enum class gpioMomentaryStateStatus : uint8_t
 #define SETUP_CODE "46637726"  // HomeKit Setup Code (only for reference, has to be changed during WiFi Configuration or from WebUI)
 #define OTA_PWD "homespan-ota" //custom password for ota
 #define DEVICE_NAME "HK" //Device name
+#define FACTORY_BOOTSTRAP_ID "FACTORY-DEFAULT-1"
+#define FACTORY_BOOTSTRAP_SECRET "shared-factory-secret"
 #define HOMEKEY_ALWAYS_UNLOCK 0 // Flag indicating if a successful Homekey authentication should always set and publish the unlock state
 #define HOMEKEY_ALWAYS_LOCK 0  // Flag indicating if a successful Homekey authentication should always set and publish the lock state
 #define HS_STATUS_LED 255 // HomeSpan Status LED GPIO pin

@@ -26,6 +26,7 @@ static ws_event_cb_t s_cb = NULL;
 static char *s_headers = NULL;
 static ws_relogin_cb_t s_relogin_cb = NULL;
 static bool s_relogin_inflight = false;
+static bool s_has_bearer = false;
 
 static TaskHandle_t s_authfail_task = NULL;
 static bool s_authfail_pending = false;
@@ -156,8 +157,13 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t 
             ESP_LOGI(TAG, "CONNECTED");
             s_relogin_inflight = false;
             s_authfail_pending = false;
-            // send initial status_check
-            (void)ws_send_text_locked("{\"type\":\"status_check\"}");
+            if (s_cb) {
+                s_cb("connected", "");
+            }
+            if (s_has_bearer) {
+                // send initial status_check only for authenticated operational sessions
+                (void)ws_send_text_locked("{\"type\":\"status_check\"}");
+            }
             break;
 
         case WEBSOCKET_EVENT_DISCONNECTED:
@@ -206,6 +212,15 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t 
                             cJSON *cmd = pl ? cJSON_GetObjectItem(pl, "command") : NULL;
                             if (cJSON_IsString(cmd) && cmd->valuestring && s_cb) {
                                 s_cb(jt->valuestring, cmd->valuestring);
+                            }
+                        }
+
+                        if (strcmp(jt->valuestring, "bootstrap_response") == 0 ||
+                            strcmp(jt->valuestring, "provisioning_update") == 0 ||
+                            strcmp(jt->valuestring, "auth_success") == 0 ||
+                            strcmp(jt->valuestring, "auth_failure") == 0) {
+                            if (s_cb) {
+                                s_cb(jt->valuestring, msg);
                             }
                         }
 
@@ -259,13 +274,14 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t 
 
 esp_err_t ws_client_start(const char *api_base, const char *bearer_token, ws_event_cb_t cb)
 {
-    if (!api_base || !bearer_token) return ESP_ERR_INVALID_ARG;
+    if (!api_base) return ESP_ERR_INVALID_ARG;
     if (s_ws) {
         ESP_LOGW(TAG, "WS already started");
         return ESP_OK;
     }
 
     s_cb = cb;
+    s_has_bearer = bearer_token && bearer_token[0];
     strncpy(s_api_base, api_base, sizeof(s_api_base) - 1);
 
     char ws_url[256];
@@ -275,10 +291,14 @@ esp_err_t ws_client_start(const char *api_base, const char *bearer_token, ws_eve
     s_headers = (char *)calloc(1, 900);
     if (!s_headers) return ESP_ERR_NO_MEM;
 
-    snprintf(s_headers, 900,
-            "Authorization: Bearer %s\r\n"
-            "Origin: %s\r\n",
-            bearer_token, api_base);
+    if (s_has_bearer) {
+        snprintf(s_headers, 900,
+                "Authorization: Bearer %s\r\n"
+                "Origin: %s\r\n",
+                bearer_token, api_base);
+    } else {
+        snprintf(s_headers, 900, "Origin: %s\r\n", api_base);
+    }
 
     esp_websocket_client_config_t cfg = {
         .uri = ws_url,
@@ -328,6 +348,7 @@ void ws_client_stop(void)
         free(s_headers);
         s_headers = NULL;
     }
+    s_has_bearer = false;
 
     if (s_ws_tx_mu) {
         vSemaphoreDelete(s_ws_tx_mu);

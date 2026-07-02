@@ -18,6 +18,7 @@ extern "C" {
 #define NVS_KEY_LAST_FW "last_fw_id"
 #define NVS_KEY_PIN "pin"
 #define NVS_KEY_RECEIVER_MAC "receiver_mac"
+#define NVS_KEY_BOOTSTRAP_USED "bootstrap_used"
 
 typedef struct {
     char wifi_ssid[33];
@@ -27,6 +28,7 @@ typedef struct {
     char api_base[192];       // "https://host"
     uint8_t receiver_mac[6];  // ESP-NOW receiver peer
     bool receiver_mac_set;
+    bool bootstrap_used;
     int  last_fw_id;          // -1 if none
 } device_config_t;
 

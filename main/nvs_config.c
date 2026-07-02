@@ -68,13 +68,19 @@ esp_err_t nvs_config_load(device_config_t *out) {
         out->receiver_mac_set = true;
     }
 
+    uint8_t bootstrap_used = 0;
+    if (nvs_get_u8(h, NVS_KEY_BOOTSTRAP_USED, &bootstrap_used) == ESP_OK) {
+        out->bootstrap_used = bootstrap_used != 0;
+    }
+
     nvs_close(h);
 
-    ESP_LOGI(TAG, "Loaded: ssid=%s uuid=%s api_base=%s last_fw_id=%d receiver_mac=%s%02X:%02X:%02X:%02X:%02X:%02X",
+    ESP_LOGI(TAG, "Loaded: ssid=%s uuid=%s api_base=%s last_fw_id=%d bootstrap_used=%s receiver_mac=%s%02X:%02X:%02X:%02X:%02X:%02X",
              out->wifi_ssid[0] ? out->wifi_ssid : "(missing)",
              out->device_uuid[0] ? out->device_uuid : "(missing)",
              out->api_base[0] ? out->api_base : "(missing)",
              out->last_fw_id,
+             out->bootstrap_used ? "true" : "false",
              out->receiver_mac_set ? "" : "(missing) ",
              out->receiver_mac[0], out->receiver_mac[1], out->receiver_mac[2],
              out->receiver_mac[3], out->receiver_mac[4], out->receiver_mac[5]);
@@ -95,6 +101,7 @@ esp_err_t nvs_config_save(const device_config_t *cfg) {
     if (cfg->device_secret[0]) ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_set_str_safe(h, NVS_KEY_SECRET, cfg->device_secret));
     if (cfg->api_base[0])    ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_set_str_safe(h, NVS_KEY_API, cfg->api_base));
     if (cfg->receiver_mac_set) ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_set_blob(h, NVS_KEY_RECEIVER_MAC, cfg->receiver_mac, sizeof(cfg->receiver_mac)));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_set_u8(h, NVS_KEY_BOOTSTRAP_USED, cfg->bootstrap_used ? 1 : 0));
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(nvs_set_i32(h, NVS_KEY_LAST_FW, (int32_t)cfg->last_fw_id));
 
