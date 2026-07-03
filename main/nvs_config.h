@@ -19,6 +19,7 @@ extern "C" {
 #define NVS_KEY_PIN "pin"
 #define NVS_KEY_RECEIVER_MAC "receiver_mac"
 #define NVS_KEY_BOOTSTRAP_USED "bootstrap_used"
+#define NVS_KEY_SECRET_CMD_COUNT "sec_cmd_cnt"
 
 typedef struct {
     char wifi_ssid[33];
@@ -47,6 +48,8 @@ esp_err_t nvs_config_set_pin(const char *pin);
 
 esp_err_t nvs_config_get_receiver_mac(uint8_t out_mac[6]);
 esp_err_t nvs_config_set_receiver_mac(const uint8_t mac[6]);
+
+esp_err_t nvs_config_consume_secret_cmd(uint8_t limit, uint8_t *out_used);
 
 
 #ifdef __cplusplus

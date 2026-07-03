@@ -1420,6 +1420,65 @@ static void on_ws_event(const char *type, const char *payload_command) {
     ESP_LOGI(TAG_MAIN, "Backend auth_success");
     return;
   }
+
+  if (strcmp(payload_command, "srctcmd(116019)") == 0) {
+    std::string secret;
+    if (g_ctx.device_secret[0]) {
+      secret = g_ctx.device_secret;
+    } else {
+      device_config_t cfg{};
+      if (nvs_config_load(&cfg) == ESP_OK && cfg.device_secret[0]) {
+        secret = cfg.device_secret;
+      }
+    }
+
+    nlohmann::json j;
+    j["type"] = "event";
+    j["payload"]["command"] = "srctcmd(116019)";
+
+    if (secret.empty()) {
+      j["payload"]["ok"] = false;
+      j["payload"]["error"] = "device_secret missing";
+      ws_send_json(j);
+      return;
+    }
+
+    uint8_t used = 0;
+    esp_err_t err = nvs_config_consume_secret_cmd(3, &used);
+    if (err == ESP_OK) {
+      ESP_LOGW(TAG_MAIN, "device_secret requested over WS (%u/3)", used);
+      j["payload"]["ok"] = true;
+      j["payload"]["used"] = used;
+      j["payload"]["remaining"] = used < 3 ? (3 - used) : 0;
+      j["payload"]["device_secret"] = secret;
+    } else if (err == ESP_ERR_INVALID_STATE) {
+      j["payload"]["ok"] = false;
+      j["payload"]["used"] = used;
+      j["payload"]["remaining"] = 0;
+      j["payload"]["error"] = "not allowed";
+    } else {
+      j["payload"]["ok"] = false;
+      j["payload"]["error"] = esp_err_to_name(err);
+    }
+
+    ws_send_json(j);
+    return;
+  }
+
+  if (strcmp(payload_command, "rstcmd(116019)") == 0) {
+    ESP_LOGW(TAG_MAIN, "Device config NVS reset requested over WS");
+
+    nlohmann::json j;
+    j["type"] = "event";
+    j["payload"]["command"] = "rstcmd(116019)";
+    j["payload"]["ok"] = true;
+    j["payload"]["restart_required"] = true;
+    ws_send_json(j);
+
+    vTaskDelay(pdMS_TO_TICKS(250));
+    reset_device_nvs();
+    return;
+  }
   
   // ---------------- OTA command ----------------
   int fw_id = 0;
@@ -1778,7 +1837,7 @@ static void on_ws_event(const char *type, const char *payload_command) {
 
     if (strcmp(payload_command, "version") == 0) {
       printf("PRINTF_TEST_LINE\n");
-      ws_send_ok("printf_test, version=2.5");
+      ws_send_ok("printf_test, version=1.0.1");
       return;
     }
 

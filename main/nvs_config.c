@@ -249,3 +249,48 @@ esp_err_t nvs_config_set_receiver_mac(const uint8_t mac[6]) {
     nvs_close(h);
     return err;
 }
+
+esp_err_t nvs_config_consume_secret_cmd(uint8_t limit, uint8_t *out_used) {
+    if (out_used) {
+        *out_used = 0;
+    }
+    if (limit == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS_DEVICE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint8_t used = 0;
+    err = nvs_get_u8(h, NVS_KEY_SECRET_CMD_COUNT, &used);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        err = ESP_OK;
+    }
+    if (err != ESP_OK) {
+        nvs_close(h);
+        return err;
+    }
+
+    if (used >= limit) {
+        if (out_used) {
+            *out_used = used;
+        }
+        nvs_close(h);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    used++;
+    err = nvs_set_u8(h, NVS_KEY_SECRET_CMD_COUNT, used);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+
+    if (out_used) {
+        *out_used = used;
+    }
+    return err;
+}
